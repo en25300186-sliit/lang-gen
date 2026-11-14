@@ -2,7 +2,24 @@ import inspect
 import os
 import sys
 from pathlib import Path
-from .core import Language, Syntax, AutoClose, Scope
+from .core import (
+    AutoClose,
+    Choice,
+    Define,
+    Grammar,
+    Language,
+    Optional,
+    Repeat,
+    Scope,
+    Sequence,
+    Syntax,
+    choice,
+    define,
+    line,
+    optional,
+    repeat,
+    sequence,
+)
 from .generators import run_all
 
 lang = Language()
@@ -27,4 +44,23 @@ def build(out_dir: str = "./dist", target: Language | None = None):
     print(f"[vsc] Built '{active.name}' ({active.id}) -> {out}")
 
 
-__all__ = ["lang", "Language", "Syntax", "AutoClose", "Scope", "build"]
+__all__ = [
+    "lang",
+    "Language",
+    "Syntax",
+    "AutoClose",
+    "Scope",
+    "Grammar",
+    "Sequence",
+    "Choice",
+    "Optional",
+    "Repeat",
+    "Define",
+    "sequence",
+    "line",
+    "choice",
+    "optional",
+    "repeat",
+    "define",
+    "build",
+]

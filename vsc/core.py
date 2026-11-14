@@ -22,6 +22,92 @@ class RuleUnion:
         return RuleUnion(other, self)
 
 
+class GrammarExpression:
+    pass
+
+
+class Sequence(GrammarExpression):
+    def __init__(self, *items):
+        self.items = items
+
+
+class Choice(GrammarExpression):
+    def __init__(self, *items):
+        self.items = items
+
+
+class Optional(GrammarExpression):
+    def __init__(self, item):
+        self.item = item
+
+
+class Repeat(GrammarExpression):
+    def __init__(self, item, minimum: int = 0, maximum: int | None = None):
+        if minimum < 0 or maximum is not None and maximum < minimum:
+            raise ValueError("Repeat bounds must be non-negative and ordered")
+        self.item = item
+        self.minimum = minimum
+        self.maximum = maximum
+
+
+class Define(GrammarExpression):
+    def __init__(self, rule):
+        self.rule = rule
+
+
+def sequence(*items):
+    return Sequence(*items)
+
+
+def line(*items):
+    return Sequence(*items)
+
+
+def choice(*items):
+    return Choice(*items)
+
+
+def optional(item):
+    return Optional(item)
+
+
+def repeat(item, minimum: int = 0, maximum: int | None = None):
+    return Repeat(item, minimum, maximum)
+
+
+def define(rule):
+    return Define(rule)
+
+
+class Grammar:
+    rules: tuple[GrammarExpression, ...] = ()
+
+    def __init__(self, *rules):
+        self.rules = tuple(rules) or tuple(self.rules)
+
+    @classmethod
+    def line(cls, *items):
+        return Sequence(*items)
+
+    def referenced_rules(self) -> set[type]:
+        found = set()
+
+        def visit(item):
+            if isinstance(item, type) and issubclass(item, Syntax):
+                found.add(item)
+            elif isinstance(item, Define):
+                visit(item.rule)
+            elif isinstance(item, (Sequence, Choice)):
+                for child in item.items:
+                    visit(child)
+            elif isinstance(item, (Optional, Repeat)):
+                visit(item.item)
+
+        for rule in self.rules:
+            visit(rule)
+        return found
+
+
 class SyntaxMeta(type):
     def __or__(cls, other):
         return RuleUnion(cls, other)
@@ -72,6 +158,7 @@ class Language:
         self.rules: dict[str, type[Syntax]] = dict(_BUILTIN_RULES)
         self.autoclose: list[tuple[str, str]] = []
         self.scope: Scope = Scope(mode="indent", _register=False)
+        self.grammar: Grammar | None = None
         self.root_file: str = ""
 
         if hasattr(vsc, "lang"):
@@ -79,6 +166,10 @@ class Language:
 
     def build(self, out_dir: str = "./dist"):
         vsc.build(out_dir=out_dir, target=self)
+
+    def use(self, grammar: Grammar | type[Grammar]):
+        self.grammar = grammar() if isinstance(grammar, type) else grammar
+        return self
 
 
 _BUILTIN_RULES: dict[str, type["Syntax"]] = {}
@@ -106,7 +197,6 @@ class Syntax(metaclass=SyntaxMeta):
     dynamic: bool = False
     scoped: bool = False
     define: str | None = None
-    next = None
     defines = None
 
     _is_template: bool = True
@@ -145,7 +235,6 @@ class Syntax(metaclass=SyntaxMeta):
             cls.dynamic
             or cls.scoped
             or bool(cls.define)
-            or (cls.next is not None)
             or (cls.defines is not None)
             or cls.has_user_detect()
         )

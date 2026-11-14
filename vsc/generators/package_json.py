@@ -6,6 +6,7 @@ def generate(lang, out_dir: Path):
     textmate_rules = []
     semantic_types = []
     semantic_rules = {}
+    grammar_rules = lang.grammar.referenced_rules() if lang.grammar else set()
 
     for name, rule in lang.rules.items():
         palette = rule.palette()
@@ -17,7 +18,7 @@ def generate(lang, out_dir: Path):
                 "settings": {"foreground": palette[0]},
             })
 
-        if rule.has_custom_detect():
+        if rule.has_custom_detect() or rule in grammar_rules:
             if len(palette) > 1:
                 for idx, hex_color in enumerate(palette):
                     tok_id = f"{name}_{idx}"

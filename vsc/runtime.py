@@ -3,33 +3,11 @@ import json
 import re
 import sys
 import threading
-from .core import RuleUnion
+from .core import Choice, Define, GrammarExpression, Optional, Repeat, Sequence
 
 TOKEN_RE = re.compile(
     r'//.*$|"(?:\\.|[^"])*"|[a-zA-Z_]\w*|\d+(?:\.\d+)?|==|!=|<=|>=|->|[(){}\[\]:,=+*/.-]|\S'
 )
-
-
-def _as_choices(spec) -> tuple:
-    if spec is None:
-        return ()
-    if isinstance(spec, RuleUnion):
-        return spec.items
-    if isinstance(spec, (tuple, list)):
-        return tuple(spec)
-    return (spec,)
-
-
-def _format_expected(choices: tuple) -> str:
-    names = []
-    for c in choices:
-        if c is None or c is type(None):
-            names.append("end of line")
-        elif isinstance(c, str):
-            names.append(repr(c))
-        elif isinstance(c, type):
-            names.append(c.__name__)
-    return " | ".join(names)
 
 
 class ScopeView:
@@ -104,8 +82,9 @@ class RawLspServer:
         self.detectors = []
         self.legend: list[str] = []
 
+        grammar_rules = lang.grammar.referenced_rules() if lang.grammar else set()
         for name, rule in lang.rules.items():
-            if rule.has_custom_detect():
+            if rule.has_custom_detect() or rule in grammar_rules:
                 inst = rule()
                 palette = rule.palette()
                 ids = [f"{name}_{i}" for i in range(len(palette))] if len(palette) > 1 else [name]
@@ -190,16 +169,114 @@ class RawLspServer:
         if rule.regex and re.fullmatch(rule.regex, tok):
             return True
         return False
+
+    @staticmethod
+    def _scope_snapshot(tracker: ScopeTracker):
+        return [
+            (indent, {owner: set(names) for owner, names in symbols.items()})
+            for indent, symbols in tracker.stack
+        ]
+
+    @staticmethod
+    def _restore_scope(tracker: ScopeTracker, snapshot):
+        tracker.stack = snapshot
+
+    def _match_expression(self, expression: GrammarExpression, tokens, pos: int, tracker: ScopeTracker):
+        if isinstance(expression, Sequence):
+            current = pos
+            for item in expression.items:
+                matched, current, expected = self._match_expression(item, tokens, current, tracker)
+                if not matched:
+                    return False, current, expected
+            return True, current, None
+
+        if isinstance(expression, Choice):
+            best = (False, pos, "valid syntax")
+            for item in expression.items:
+                token_count = len(self._pending_tokens)
+                scope_snapshot = self._scope_snapshot(tracker)
+                result = self._match_expression(item, tokens, pos, tracker)
+                if result[0]:
+                    return result
+                del self._pending_tokens[token_count:]
+                self._restore_scope(tracker, scope_snapshot)
+                if result[1] > best[1]:
+                    best = result
+            return best
+
+        if isinstance(expression, Optional):
+            token_count = len(self._pending_tokens)
+            scope_snapshot = self._scope_snapshot(tracker)
+            matched, next_pos, _ = self._match_expression(expression.item, tokens, pos, tracker)
+            if not matched:
+                del self._pending_tokens[token_count:]
+                self._restore_scope(tracker, scope_snapshot)
+            return True, next_pos if matched else pos, None
+
+        if isinstance(expression, Repeat):
+            current = pos
+            count = 0
+            while expression.maximum is None or count < expression.maximum:
+                token_count = len(self._pending_tokens)
+                scope_snapshot = self._scope_snapshot(tracker)
+                matched, next_pos, expected = self._match_expression(expression.item, tokens, current, tracker)
+                if not matched or next_pos == current:
+                    del self._pending_tokens[token_count:]
+                    self._restore_scope(tracker, scope_snapshot)
+                    break
+                current = next_pos
+                count += 1
+            if count < expression.minimum:
+                return False, current, "repeated expression"
+            return True, current, None
+
+        if pos >= len(tokens):
+            return False, pos, self._format_expression(expression)
+
+        tok, start, end = tokens[pos]
+        rule = self.lang.rules.get(expression) if isinstance(expression, str) else expression
+        if isinstance(rule, type):
+            if isinstance(expression, Define):
+                rule = expression.rule
+            if self._rule_matches_token(rule, tok, tracker):
+                self._emit_rule_token(rule, start, end, self._current_line_no)
+                return True, pos + 1, None
+            return False, pos, rule.__name__
+        if isinstance(expression, Define):
+            target = self.lang.rules.get(expression.rule, expression.rule)
+            if isinstance(target, type) and tok.isidentifier():
+                ScopeView(tracker, target.__name__, target.scoped).add(tok)
+                self._emit_rule_token(target, start, end, self._current_line_no)
+                return True, pos + 1, None
+            return False, pos, target.__name__ if isinstance(target, type) else repr(target)
+        if tok == expression:
+            return True, pos + 1, None
+        return False, pos, repr(expression)
+
+    def _format_expression(self, expression) -> str:
+        if isinstance(expression, type):
+            return expression.__name__
+        if isinstance(expression, Define):
+            name = expression.rule.__name__ if isinstance(expression.rule, type) else str(expression.rule)
+            return f"identifier for {name}"
+        if isinstance(expression, (Sequence, Choice, Optional, Repeat)):
+            return "valid syntax"
+        return repr(expression)
+
+    def _emit_rule_token(self, rule, start: int, end: int, line_no: int):
+        for detector in self.detectors:
+            if detector["name"] == rule.__name__:
+                ids = detector["ids"]
+                tok_idx = self.legend.index(ids[0])
+                self._pending_tokens.append((line_no, start, end - start, tok_idx))
+                return
+
     def analyze_document(self, text: str) -> tuple[list[int], list[dict]]:
         raw_tokens: list[tuple[int, int, int, int]] = []
         diagnostics: list[dict] = []
         lines = text.splitlines()
         tracker = ScopeTracker(self.lang.scope, lines)
-
-        def resolve(c):
-            if isinstance(c, str):
-                return self.lang.rules.get(c, c)
-            return c
+        self._pending_tokens = raw_tokens
 
         def emit_idx(line_no: int, start: int, end: int, token_ids: list[str], color_idx: int = 0):
             if end > start:
@@ -234,10 +311,10 @@ class RawLspServer:
 
         grammar_rules = [
             r for r in self.lang.rules.values()
-            if r.word or r.words or r.scoped or r.next is not None or r.defines is not None
+            if r.word or r.words or r.scoped or r.defines is not None
         ]
 
-        # 2. Line-by-line pass (scopes + custom detect + grammar transitions)
+        # 2. Line-by-line pass (scopes + custom detection + grammar matching)
         for line_no, line in enumerate(lines):
             if not tracker.before_line(line_no, line):
                 continue
@@ -265,72 +342,36 @@ class RawLspServer:
                         if span != skip_span and w.group(0) in scope_view:
                             emit_idx(line_no, span[0], span[1], d["ids"])
 
-            pending_define = None
-            expected_next = None
-            prev_tok = ""
-            prev_end = 0
-
-            for m in TOKEN_RE.finditer(line):
-                tok, start, end = m.group(0), m.start(), m.end()
-                if tok.startswith("//"):
-                    break
-
-                matched_rule = None
-
-                if pending_define is not None:
-                    target = resolve(pending_define)
-                    if isinstance(target, type) and tok.isidentifier():
-                        ScopeView(tracker, target.__name__, target.scoped).add(tok)
-                        emit_rule(line_no, start, end, target.__name__)
-                        matched_rule = target
-                    else:
-                        expected = target.__name__ if isinstance(target, type) else repr(target)
-                        err(line_no, start, end, f"Expected {expected} after {prev_tok!r}, got {tok!r}")
-                    pending_define = None
-
-                elif expected_next is not None:
-                    choices = tuple(resolve(c) for c in _as_choices(expected_next))
-                    ok = False
-                    for c in choices:
-                        if isinstance(c, str) and tok == c:
-                            ok = True
+            token_matches = [
+                (m.group(0), m.start(), m.end())
+                for m in TOKEN_RE.finditer(line)
+                if not m.group(0).startswith("//")
+            ]
+            self._current_line_no = line_no
+            if self.lang.grammar and token_matches:
+                best = (False, 0, "valid syntax")
+                for expression in self.lang.grammar.rules:
+                    token_count = len(raw_tokens)
+                    scope_snapshot = self._scope_snapshot(tracker)
+                    result = self._match_expression(expression, token_matches, 0, tracker)
+                    if result[0] and result[1] == len(token_matches):
+                        best = result
+                        break
+                    del raw_tokens[token_count:]
+                    self._restore_scope(tracker, scope_snapshot)
+                    if result[1] > best[1]:
+                        best = result
+                if not best[0] or best[1] != len(token_matches):
+                    error_pos = best[1]
+                    start = token_matches[error_pos][1] if error_pos < len(token_matches) else len(line)
+                    actual = token_matches[error_pos][0] if error_pos < len(token_matches) else "end of line"
+                    err(line_no, start, start + max(1, len(actual)), f"Expected {best[2]}, got {actual!r}")
+            else:
+                for tok, start, end in token_matches:
+                    for rule in grammar_rules:
+                        if self._rule_matches_token(rule, tok, tracker):
+                            emit_rule(line_no, start, end, rule.__name__)
                             break
-                        if isinstance(c, type) and self._rule_matches_token(c, tok, tracker):
-                            emit_rule(line_no, start, end, c.__name__)
-                            matched_rule = c
-                            ok = True
-                            break
-                    if not ok:
-                        err(line_no, start, end, f"Expected {_format_expected(choices)} after {prev_tok!r}, got {tok!r}")
-                    expected_next = None
-
-                else:
-                    for r in grammar_rules:
-                        if self._rule_matches_token(r, tok, tracker):
-                            emit_rule(line_no, start, end, r.__name__)
-                            matched_rule = r
-                            break
-
-                if matched_rule is not None:
-                    if matched_rule.defines is not None:
-                        pending_define = matched_rule.defines
-                    elif matched_rule.next is not None:
-                        expected_next = matched_rule.next
-
-                prev_tok, prev_end = tok, end
-
-            if pending_define is not None:
-                target = resolve(pending_define)
-                expected = target.__name__ if isinstance(target, type) else repr(target)
-                err(line_no, prev_end, prev_end + 1, f"Expected {expected} after {prev_tok!r}")
-            elif expected_next is not None:
-                choices = tuple(resolve(c) for c in _as_choices(expected_next))
-                allows_eol = any(
-                    c is None or c is type(None) or (isinstance(c, type) and getattr(c, "word", None) == "\n")
-                    for c in choices
-                )
-                if not allows_eol:
-                    err(line_no, prev_end, prev_end + 1, f"Expected {_format_expected(choices)} after {prev_tok!r}")
 
             tracker.after_line(line_no, line)
 
