@@ -61,14 +61,15 @@ class ScopeTracker:
         self.lines = lines
         self.stack: list[tuple[int, dict[str, set[str]]]] = [(-1, {})]
 
-    def _next_nonempty_indent(self, idx: int) -> int:
-        for j in range(idx + 1, len(self.lines)):
+    def _next_nonempty_indent(self, _idx: int) -> int:
+        for j in range(_idx + 1, len(self.lines)):
             s = self.lines[j].strip()
             if s and not s.startswith("//"):
                 return len(self.lines[j]) - len(self.lines[j].lstrip())
         return 0
 
     def before_line(self, idx: int, line: str) -> bool:
+        del idx
         stripped = line.strip()
         if not stripped or stripped.startswith("//"):
             return False
@@ -150,6 +151,34 @@ class RawLspServer:
             return None
         return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
 
+    @staticmethod
+    def _utf16_column_to_index(line: str, column: int) -> int:
+        units = 0
+        for index, char in enumerate(line):
+            if units >= column:
+                return index
+            units += 2 if ord(char) > 0xFFFF else 1
+        return len(line)
+
+    @classmethod
+    def _apply_change(cls, text: str, change: dict) -> str:
+        replacement = change["text"]
+        if "range" not in change:
+            return replacement
+
+        lines = text.splitlines(keepends=True)
+        start = change["range"]["start"]
+        end = change["range"]["end"]
+        start_line = min(start["line"], len(lines))
+        end_line = min(end["line"], len(lines))
+        start_text = lines[start_line] if start_line < len(lines) else ""
+        end_text = lines[end_line] if end_line < len(lines) else ""
+        start_offset = sum(len(line) for line in lines[:start_line])
+        end_offset = sum(len(line) for line in lines[:end_line])
+        start_offset += cls._utf16_column_to_index(start_text, start["character"])
+        end_offset += cls._utf16_column_to_index(end_text, end["character"])
+        return text[:start_offset] + replacement + text[end_offset:]
+
     def _rule_matches_token(self, rule, tok: str, tracker: ScopeTracker) -> bool:
         all_words = set(rule.words) | ({rule.word} if rule.word else set())
         if tok in all_words:
@@ -168,7 +197,9 @@ class RawLspServer:
         tracker = ScopeTracker(self.lang.scope, lines)
 
         def resolve(c):
-            return self.lang.rules[c] if isinstance(c, str) and c in self.lang.rules else c
+            if isinstance(c, str):
+                return self.lang.rules.get(c, c)
+            return c
 
         def emit_idx(line_no: int, start: int, end: int, token_ids: list[str], color_idx: int = 0):
             if end > start:
@@ -248,12 +279,13 @@ class RawLspServer:
 
                 if pending_define is not None:
                     target = resolve(pending_define)
-                    if tok.isidentifier():
+                    if isinstance(target, type) and tok.isidentifier():
                         ScopeView(tracker, target.__name__, target.scoped).add(tok)
                         emit_rule(line_no, start, end, target.__name__)
                         matched_rule = target
                     else:
-                        err(line_no, start, end, f"Expected {target.__name__} after {prev_tok!r}, got {tok!r}")
+                        expected = target.__name__ if isinstance(target, type) else repr(target)
+                        err(line_no, start, end, f"Expected {expected} after {prev_tok!r}, got {tok!r}")
                     pending_define = None
 
                 elif expected_next is not None:
@@ -289,7 +321,8 @@ class RawLspServer:
 
             if pending_define is not None:
                 target = resolve(pending_define)
-                err(line_no, prev_end, prev_end + 1, f"Expected {target.__name__} after {prev_tok!r}")
+                expected = target.__name__ if isinstance(target, type) else repr(target)
+                err(line_no, prev_end, prev_end + 1, f"Expected {expected} after {prev_tok!r}")
             elif expected_next is not None:
                 choices = tuple(resolve(c) for c in _as_choices(expected_next))
                 allows_eol = any(
@@ -342,8 +375,11 @@ class RawLspServer:
             self.publish_diagnostics(doc["uri"], diags)
         elif method == "textDocument/didChange":
             uri = params["textDocument"]["uri"]
-            self.docs[uri] = params["contentChanges"][-1]["text"]
-            _, diags = self.analyze_document(self.docs[uri])
+            text = self.docs.get(uri, "")
+            for change in params["contentChanges"]:
+                text = self._apply_change(text, change)
+            self.docs[uri] = text
+            _, diags = self.analyze_document(text)
             self.publish_diagnostics(uri, diags)
         elif method == "textDocument/didClose":
             uri = params["textDocument"]["uri"]

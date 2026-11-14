@@ -15,8 +15,9 @@ def build(out_dir: str = "./dist", target: Language | None = None):
     active = target or lang
     if not active.root_file:
         main_mod = sys.modules.get("__main__")
-        if main_mod and getattr(main_mod, "__file__", None):
-            active.root_file = os.path.abspath(main_mod.__file__)
+        main_file = getattr(main_mod, "__file__", None) if main_mod else None
+        if main_file:
+            active.root_file = os.path.abspath(main_file)
         else:
             active.root_file = os.path.abspath(inspect.stack()[1].filename)
 

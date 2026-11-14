@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 def generate(lang, out_dir: Path):
+    del lang
     vscode_dir = out_dir / ".vscode"
     vscode_dir.mkdir(parents=True, exist_ok=True)
 

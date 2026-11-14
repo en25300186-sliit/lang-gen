@@ -1,4 +1,5 @@
 import re
+from typing import ClassVar
 import vsc
 
 
@@ -84,6 +85,13 @@ _BUILTIN_RULES: dict[str, type["Syntax"]] = {}
 
 
 class Syntax(metaclass=SyntaxMeta):
+    NewLine: ClassVar[type["Syntax"]]
+    LineComment: ClassVar[type["Syntax"]]
+    BlockComment: ClassVar[type["Syntax"]]
+    String: ClassVar[type["Syntax"]]
+    pairs: ClassVar[type["Syntax"]]
+    Keyword: ClassVar[type["Syntax"]]
+
     color: str | None = None
     colors: tuple[str, ...] = ()
     regex: str | None = None
@@ -124,6 +132,7 @@ class Syntax(metaclass=SyntaxMeta):
         print(f"[vsc] {action} Syntax: {cls.__name__}")
 
     def detect(self, line: str):
+        del line
         return None
 
     @classmethod
